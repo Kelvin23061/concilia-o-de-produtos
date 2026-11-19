@@ -1,0 +1,234 @@
+<div class="shell">
+
+  <aside class="sidebar">
+    <div class="sidebar-brand">
+      <span class="sidebar-brand-icon">▥</span>
+      <div>
+        <div class="sidebar-brand-name">Conciliação&nbsp;NF-e</div>
+        <div class="sidebar-brand-sub">Conciliação de códigos</div>
+      </div>
+    </div>
+
+    <nav class="sidebar-nav">
+      <button class="nav-item active" data-nav="painel"><span class="ic">▦</span> Painel</button>
+      <button class="nav-item" data-nav="produtos"><span class="ic">▤</span> Produtos</button>
+      <button class="nav-item" data-nav="importar"><span class="ic">⇪</span> Importar planilha</button>
+      <button class="nav-item" data-nav="conciliar"><span class="ic">⇄</span> Conciliar nota</button>
+      <button class="nav-item" data-nav="notas"><span class="ic">▧</span> Notas fiscais</button>
+    </nav>
+  </aside>
+
+  <main class="main">
+
+    <!-- ================= PAINEL ================= -->
+    <section class="view active" id="view-painel">
+      <div class="hero">
+        <svg class="hero-decor" viewBox="0 0 400 400" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <linearGradient id="waveGradA" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0%" stop-color="#22D3EE" stop-opacity="0.55"/>
+              <stop offset="100%" stop-color="#818CF8" stop-opacity="0.05"/>
+            </linearGradient>
+            <linearGradient id="waveGradB" x1="0" y1="1" x2="1" y2="0">
+              <stop offset="0%" stop-color="#818CF8" stop-opacity="0.5"/>
+              <stop offset="100%" stop-color="#22D3EE" stop-opacity="0.05"/>
+            </linearGradient>
+            <linearGradient id="waveGradC" x1="0" y1="0" x2="1" y2="0">
+              <stop offset="0%" stop-color="#67E8F9" stop-opacity="0"/>
+              <stop offset="50%" stop-color="#67E8F9" stop-opacity="0.9"/>
+              <stop offset="100%" stop-color="#67E8F9" stop-opacity="0"/>
+            </linearGradient>
+          </defs>
+          <path class="wave-a" d="M -20 90 C 80 40, 160 160, 260 90 S 420 40, 480 110"/>
+          <path class="wave-b" d="M -20 180 C 90 120, 170 240, 270 170 S 430 120, 480 200"/>
+          <path class="wave-c" d="M -20 140 C 85 80, 165 200, 265 130 S 425 80, 480 150"/>
+          <path class="wave-a" d="M -20 260 C 80 210, 160 320, 260 260 S 420 210, 480 280" opacity="0.6"/>
+        </svg>
+        <div class="hero-content">
+          <div class="hero-eyebrow"><span class="dot"></span> Sistema de conciliação</div>
+          <h1>Concilie códigos de barra entre notas fiscais e sua base mestre</h1>
+          <p>Importe o XML da nota fiscal, compare com a base de produtos da planilha e trate as divergências em segundos — tudo processado no navegador.</p>
+          <div class="hero-actions">
+            <button class="btn" data-nav="conciliar">⇄ Conciliar nota agora</button>
+            <button class="btn ghost" data-nav="importar">▤ Importar planilha</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="kpi-grid">
+        <div class="kpi-card">
+          <div><div class="kpi-label">Notas importadas</div><div class="kpi-value" id="kpi-notas">0</div></div>
+          <span class="kpi-icon indigo">▤</span>
+        </div>
+        <div class="kpi-card">
+          <div><div class="kpi-label">Itens conciliados</div><div class="kpi-value" id="kpi-conciliados">0</div></div>
+          <span class="kpi-icon ok">✓</span>
+        </div>
+        <div class="kpi-card">
+          <div><div class="kpi-label">Divergências</div><div class="kpi-value" id="kpi-divergencias">0</div></div>
+          <span class="kpi-icon warn">⚠</span>
+        </div>
+        <div class="kpi-card">
+          <div><div class="kpi-label">Produtos na base</div><div class="kpi-value" id="kpi-produtos">0</div></div>
+          <span class="kpi-icon laser">▧</span>
+        </div>
+      </div>
+
+      <div class="recent-panel">
+        <div class="recent-header">
+          <span class="recent-title">Notas recentes</span>
+          <button class="recent-link" data-nav="notas">Ver todas →</button>
+        </div>
+        <div id="recent-list"><div class="recent-empty">nenhuma nota conciliada ainda</div></div>
+      </div>
+    </section>
+
+    <!-- ================= PRODUTOS ================= -->
+    <section class="view" id="view-produtos">
+      <div class="page-header">
+        <div>
+          <p class="page-title">Produtos</p>
+          <p class="page-sub">Todos os itens das notas conciliadas, comparados linha a linha contra a base de cadastro.</p>
+        </div>
+      </div>
+
+      <div class="stats" id="stats" style="display:none;">
+        <div class="stat total"><div class="n" id="s-total">0</div><div class="l">itens analisados</div></div>
+        <div class="stat ok"><div class="n" id="s-ok">0</div><div class="l">conferidos por código de barras</div></div>
+        <div class="stat danger"><div class="n" id="s-danger">0</div><div class="l">não localizados na planilha</div></div>
+      </div>
+
+      <div class="results" id="results">
+        <div class="toolbar">
+          <div class="chips" id="chips">
+            <button class="chip active" data-filter="all">todos</button>
+            <button class="chip" data-filter="ok">conferidos</button>
+            <button class="chip" data-filter="warn">parcial</button>
+            <button class="chip" data-filter="danger">não localizados</button>
+          </div>
+          <div class="toolbar-right">
+            <input class="search-input" id="search" placeholder="buscar código, descrição, fornecedor…">
+            <button class="btn ghost" id="btn-export">Exportar CSV</button>
+            <button class="btn ghost" id="btn-export-ok">Exportar conferidos (Excel)</button>
+            <button class="btn ghost" id="btn-export-danger">Exportar não localizados (Excel)</button>
+          </div>
+        </div>
+
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>NF</th>
+                <th>Item</th>
+                <th>Cód. barras (NF)</th>
+                <th>Descrição na nota</th>
+                <th>Qtd. NF</th>
+                <th>Emb. NF</th>
+                <th>Cód. interno</th>
+                <th>Fornecedor</th>
+                <th>Descrição catálogo</th>
+                <th>Emb. cadastro</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= IMPORTAR PLANILHA ================= -->
+    <section class="view" id="view-importar">
+      <div class="page-header">
+        <div>
+          <p class="page-title">Importar planilha</p>
+          <p class="page-sub">Carregada uma vez, a planilha fica fixada nesta sessão. Em navegadores compatíveis (Chrome/Edge), o sistema detecta sozinho quando você salva alterações no Excel e reindexa a base automaticamente.</p>
+        </div>
+      </div>
+
+      <div class="panel">
+        <p class="panel-title">Base de cadastro</p>
+        <p class="panel-sub">SEQPRODUTO · CODACESSO · DESCCOMPLETA · FORNECEDOR · EMBALAGEM · TIPCODIGO</p>
+
+        <div class="dropzone" id="dz-xlsx">
+          <div class="dz-body" id="dz-xlsx-body">
+            <div class="dz-icon">▤</div>
+            <div class="dz-label">Planilha de códigos (.xlsx)</div>
+            <div class="dz-hint">SEQPRODUTO · CODACESSO · DESCCOMPLETA · FORNECEDOR</div>
+          </div>
+          <div class="dz-pinned" id="dz-xlsx-pinned" style="display:none;">
+            <div class="dz-pinned-info">
+              <span class="pin-check">✓</span>
+              <div>
+                <div class="dz-pinned-name" id="dz-xlsx-name">—</div>
+                <div class="dz-pinned-meta" id="dz-xlsx-meta">—</div>
+              </div>
+            </div>
+            <button type="button" class="btn ghost small" id="btn-update-catalog">Atualizar planilha</button>
+          </div>
+        </div>
+        <input type="file" id="input-xlsx" accept=".xlsx,.xls">
+
+        <div class="progress-wrap" id="progress-wrap-xlsx">
+          <div class="progress-track"><div class="progress-fill" id="progress-fill-xlsx"></div></div>
+          <div class="progress-label" id="progress-label-xlsx">lendo planilha…</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= CONCILIAR NOTA ================= -->
+    <section class="view" id="view-conciliar">
+      <div class="page-header">
+        <div>
+          <p class="page-title">Conciliar nota</p>
+          <p class="page-sub">Envie um ou mais XMLs de NF-e para conciliar contra a base de cadastro carregada.</p>
+        </div>
+      </div>
+
+      <div class="panel">
+        <p class="panel-title">Notas fiscais (XML)</p>
+        <p class="panel-sub">Os arquivos ficam só na memória do navegador durante esta sessão.</p>
+
+        <div class="dropzone" id="dz-xml">
+          <div class="dz-body" id="dz-xml-body">
+            <div class="dz-icon">⌘</div>
+            <div class="dz-label">XML(s) da nota fiscal</div>
+            <div class="dz-hint">um ou mais arquivos de NF-e</div>
+            <div class="dz-filelist" id="dz-xml-list"></div>
+          </div>
+        </div>
+        <input type="file" id="input-xml" accept=".xml" multiple>
+
+        <div class="run-row">
+          <div class="run-row-buttons">
+            <button class="btn" id="btn-run" disabled>Iniciar conciliação</button>
+            <button class="btn ghost" id="btn-clear-xml" disabled>Limpar XML</button>
+          </div>
+          <span class="status-text" id="status-text">aguardando a planilha de códigos</span>
+        </div>
+
+        <div class="progress-wrap" id="progress-wrap">
+          <div class="progress-track"><div class="progress-fill" id="progress-fill"></div></div>
+          <div class="progress-label" id="progress-label">conciliando…</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= NOTAS FISCAIS ================= -->
+    <section class="view" id="view-notas">
+      <div class="page-header">
+        <div>
+          <p class="page-title">Notas fiscais</p>
+          <p class="page-sub">Número, fornecedor, valor total e percentual de itens cadastrados por nota.</p>
+        </div>
+      </div>
+      <div class="panel notes-panel" id="notes-panel" style="display:none;">
+        <div class="notes-grid" id="notes-grid"></div>
+      </div>
+      <div class="recent-empty" id="notes-empty">nenhuma nota conciliada ainda</div>
+    </section>
+
+    <footer>conciliação executada 100% no navegador — os arquivos não são enviados a nenhum servidor</footer>
+  </main>
+</div>
+

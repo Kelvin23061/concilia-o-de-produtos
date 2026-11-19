@@ -1,0 +1,778 @@
+
+(function(){
+  "use strict";
+
+  // ---------- state ----------
+  let xmlFiles = [];
+  let catalogByCode = new Map();   // normalized barcode -> record
+  let catalogFixed = false;        // planilha carregada e fixada nesta sessão
+  let catalogMeta = null;          // { fileName, rowCount, indexedCount }
+  let catalogFileHandle = null;    // FileSystemFileHandle (quando suportado) para checar alterações
+  let catalogLastModified = null;
+  let watchTimer = null;
+  const WATCH_INTERVAL_MS = 15000;
+  const supportsFSAccess = typeof window.showOpenFilePicker === 'function';
+  let allRows = [];                // conciliation result rows
+  let activeFilter = 'all';
+
+  const $ = (id) => document.getElementById(id);
+
+  // ---------- helpers ----------
+  function escapeHtml(s){
+    return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+
+  // Normalize a barcode-ish string for comparison: digits only, strip leading zeros.
+  function normCode(v){
+    if(v === null || v === undefined) return '';
+    let s = String(v).trim().replace(/\D/g, '');
+    s = s.replace(/^0+(?=\d)/, '');
+    return s;
+  }
+
+  function setProgress(barId, fillId, labelId, pct, label){
+    $(barId).classList.add('active');
+    $(fillId).style.width = pct + '%';
+    $(labelId).textContent = label;
+  }
+  function hideProgress(barId){
+    $(barId).classList.remove('active');
+  }
+
+  // ---------- dropzone: planilha (base fixada) ----------
+  const dzXlsx = $('dz-xlsx');
+  const inputXlsx = $('input-xlsx');
+  const XLSX_PICKER_TYPES = [{
+    description: 'Planilha Excel',
+    accept: {
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'],
+      'application/vnd.ms-excel': ['.xls']
+    }
+  }];
+
+  async function pickCatalogFile(){
+    if(supportsFSAccess){
+      try{
+        const [handle] = await window.showOpenFilePicker({ types: XLSX_PICKER_TYPES, multiple: false });
+        const file = await handle.getFile();
+        await loadCatalogFile(file, handle);
+        return;
+      } catch(err){
+        if(err && err.name === 'AbortError') return; // usuário cancelou a seleção, nada a fazer
+        // seletor avançado indisponível neste contexto (ex.: iframe/preview sandboxado) — cai para upload comum
+        console.warn('seletor de arquivos avançado indisponível, usando upload padrão:', err);
+      }
+    }
+    inputXlsx.click();
+  }
+
+  dzXlsx.addEventListener('click', ()=>{ if(!catalogFixed) pickCatalogFile(); });
+  ['dragenter','dragover'].forEach(evt=>{
+    dzXlsx.addEventListener(evt, (e)=>{ e.preventDefault(); if(!catalogFixed) dzXlsx.classList.add('drag'); });
+  });
+  ['dragleave','drop'].forEach(evt=>{
+    dzXlsx.addEventListener(evt, (e)=>{ e.preventDefault(); dzXlsx.classList.remove('drag'); });
+  });
+  dzXlsx.addEventListener('drop', async (e)=>{
+    e.preventDefault();
+    if(catalogFixed) return;
+    const item = e.dataTransfer.items && e.dataTransfer.items[0];
+    let handle = null;
+    let f = null;
+    if(item && typeof item.getAsFileSystemHandle === 'function'){
+      try{
+        handle = await item.getAsFileSystemHandle();
+        f = await handle.getFile();
+      } catch(err){
+        handle = null; f = null;
+      }
+    }
+    if(!f){
+      f = e.dataTransfer.files && e.dataTransfer.files[0];
+    }
+    if(f) loadCatalogFile(f, handle);
+  });
+  inputXlsx.addEventListener('change', (e)=>{
+    const f = e.target.files && e.target.files[0];
+    if(f) loadCatalogFile(f, null);
+    inputXlsx.value = '';
+  });
+
+  $('btn-update-catalog').addEventListener('click', (e)=>{
+    e.stopPropagation();
+    pickCatalogFile();
+  });
+
+  function stopAutoWatch(){
+    if(watchTimer){ clearInterval(watchTimer); watchTimer = null; }
+  }
+
+  function startAutoWatch(){
+    stopAutoWatch();
+    if(!catalogFileHandle) return;
+    watchTimer = setInterval(async ()=>{
+      try{
+        const file = await catalogFileHandle.getFile();
+        if(file.lastModified !== catalogLastModified){
+          await loadCatalogFile(file, catalogFileHandle, { silentReindex: true });
+        }
+      } catch(err){
+        console.warn('não foi possível checar atualizações da planilha automaticamente', err);
+        stopAutoWatch();
+      }
+    }, WATCH_INTERVAL_MS);
+  }
+
+  function watchStatusLabel(){
+    if(catalogFileHandle) return 'atualização automática ativa · verificando a cada 15s';
+    return supportsFSAccess
+      ? 'clique em "Atualizar planilha" e selecione o arquivo para ativar a atualização automática'
+      : 'atualização automática indisponível neste navegador — use "Atualizar planilha" após editar o Excel';
+  }
+
+  async function loadCatalogFile(file, handle, opts){
+    opts = opts || {};
+    dzXlsx.classList.remove('drag');
+    if(!opts.silentReindex){ $('status-text').textContent = 'lendo planilha de cadastro…'; }
+    try{
+      const { map, rowCount } = await readCatalog(file);
+      catalogByCode = map;
+      catalogFixed = true;
+      catalogMeta = { fileName: file.name, rowCount, indexedCount: map.size };
+      catalogFileHandle = handle || null;
+      catalogLastModified = file.lastModified;
+
+      $('dz-xlsx-name').textContent = file.name;
+      $('dz-xlsx-meta').innerHTML =
+        `${rowCount.toLocaleString('pt-BR')} linhas lidas · ${map.size.toLocaleString('pt-BR')} códigos indexados` +
+        `<br><span class="watch-status">${watchStatusLabel()}</span>`;
+      $('dz-xlsx-body').style.display = 'none';
+      $('dz-xlsx-pinned').style.display = 'flex';
+      dzXlsx.classList.add('fixed');
+
+      startAutoWatch();
+
+      const hadResults = allRows.length > 0;
+      if(opts.silentReindex && hadResults && xmlFiles.length){
+        // planilha foi atualizada sozinha e já havia uma conciliação em tela: refaz o casamento
+        $('status-text').textContent = `planilha atualizada automaticamente às ${new Date().toLocaleTimeString('pt-BR')} — reconciliando de novo…`;
+        await runReconciliation();
+        $('status-text').textContent = `base atualizada automaticamente às ${new Date().toLocaleTimeString('pt-BR')} — ${allRows.length} itens reconciliados`;
+      } else {
+        // planilha trocada manualmente invalida resultados da tabela item a item desta sessão
+        // (o histórico de notas em "Notas Fiscais" é preservado — não é apagado por isso)
+        allRows = [];
+        $('results').classList.remove('active');
+        $('stats').style.display = 'none';
+        updateRunState();
+      }
+      renderNotesSummary();
+
+      hideProgress('progress-wrap-xlsx');
+    } catch(err){
+      console.error(err);
+      hideProgress('progress-wrap-xlsx');
+      $('status-text').textContent = 'erro ao ler a planilha: ' + err.message;
+    }
+  }
+
+  // ---------- dropzone: XML ----------
+  const dzXml = $('dz-xml');
+  const inputXml = $('input-xml');
+
+  dzXml.addEventListener('click', ()=> inputXml.click());
+  ['dragenter','dragover'].forEach(evt=>{
+    dzXml.addEventListener(evt, (e)=>{ e.preventDefault(); dzXml.classList.add('drag'); });
+  });
+  ['dragleave','drop'].forEach(evt=>{
+    dzXml.addEventListener(evt, (e)=>{ e.preventDefault(); dzXml.classList.remove('drag'); });
+  });
+  dzXml.addEventListener('drop', (e)=>{
+    e.preventDefault();
+    if(e.dataTransfer.files && e.dataTransfer.files.length) setXmlFiles(e.dataTransfer.files);
+  });
+  inputXml.addEventListener('change', (e)=>{
+    if(e.target.files && e.target.files.length) setXmlFiles(e.target.files);
+    inputXml.value = '';
+  });
+
+  function setXmlFiles(files){
+    xmlFiles = Array.from(files);
+    dzXml.classList.add('filled');
+    $('dz-xml-list').innerHTML = xmlFiles.map(f=>`<div>${escapeHtml(f.name)}</div>`).join('');
+    updateRunState();
+  }
+
+  $('btn-clear-xml').addEventListener('click', (e)=>{
+    e.stopPropagation();
+    xmlFiles = [];
+    dzXml.classList.remove('filled');
+    $('dz-xml-list').innerHTML = '';
+    allRows = [];
+    $('results').classList.remove('active');
+    $('stats').style.display = 'none';
+    updateRunState();
+    renderNotesSummary(); // histórico de notas já conciliadas continua visível
+  });
+
+  function updateRunState(){
+    $('btn-run').disabled = !(catalogFixed && xmlFiles.length > 0);
+    $('btn-clear-xml').disabled = xmlFiles.length === 0;
+    if(!catalogFixed){
+      $('status-text').textContent = 'aguardando a planilha de códigos';
+    } else if(xmlFiles.length === 0){
+      $('status-text').textContent = 'planilha fixada — aguardando XML(s) da nota fiscal';
+    } else {
+      $('status-text').textContent = `pronto: base fixada · ${xmlFiles.length} XML(s)`;
+    }
+  }
+  updateRunState();
+
+  // ---------- xlsx parsing ----------
+  function readCatalog(file){
+    return new Promise((resolve, reject)=>{
+      const reader = new FileReader();
+      reader.onload = (e)=>{
+        try{
+          setProgress('progress-wrap-xlsx','progress-fill-xlsx','progress-label-xlsx', 20, 'interpretando planilha…');
+          const data = new Uint8Array(e.target.result);
+          const wb = XLSX.read(data, { type:'array' });
+          const sheetName = wb.SheetNames.find(n => {
+            const ws = wb.Sheets[n];
+            return ws && ws['!ref'];
+          }) || wb.SheetNames[0];
+          const ws = wb.Sheets[sheetName];
+          const rows = XLSX.utils.sheet_to_json(ws, { defval:'', raw:true });
+
+          setProgress('progress-wrap-xlsx','progress-fill-xlsx','progress-label-xlsx', 60, `indexando ${rows.length.toLocaleString('pt-BR')} linhas…`);
+
+          const map = new Map();
+          let indexed = 0;
+          for(const r of rows){
+            // tolerate header variations
+            const seq   = r.SEQPRODUTO ?? r.Seqproduto ?? r.seqproduto ?? '';
+            const forn  = r.FORNECEDOR ?? r.Fornecedor ?? r.fornecedor ?? r.EMPRESA ?? '';
+            const cod   = r.CODACESSO  ?? r.Codacesso  ?? r.codacesso  ?? '';
+            const desc  = r.DESCCOMPLETA ?? r.Desccompleta ?? r.desccompleta ?? '';
+            const emb   = r.EMBALAGEM ?? r.Embalagem ?? r.embalagem ?? '';
+            const tipo  = r.TIPCODIGO ?? r.Tipcodigo ?? r.tipcodigo ?? '';
+
+            const key = normCode(cod);
+            if(!key) continue;
+            // first occurrence wins if duplicates exist in source data
+            if(!map.has(key)){
+              map.set(key, {
+                seqProduto: String(seq).trim(),
+                fornecedor: String(forn).trim(),
+                codAcesso: String(cod).trim(),
+                descricao: String(desc).trim(),
+                embalagem: String(emb).trim(),
+                tipoCodigo: String(tipo).trim()
+              });
+            }
+            indexed++;
+          }
+          setProgress('progress-wrap-xlsx','progress-fill-xlsx','progress-label-xlsx', 100, 'planilha indexada');
+          resolve({ map, rowCount: rows.length });
+        } catch(err){ reject(err); }
+      };
+      reader.onerror = reject;
+      reader.readAsArrayBuffer(file);
+    });
+  }
+
+  // ---------- xml (NF-e) parsing ----------
+  function parseNFeXml(text, filename){
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(text, 'application/xml');
+    if(doc.querySelector('parsererror')){
+      return { error: 'XML inválido', filename };
+    }
+
+    // namespace-agnostic getter
+    function tag(el, name){
+      if(!el) return null;
+      const found = el.getElementsByTagName(name);
+      return found.length ? found[0] : null;
+    }
+    function txt(el, name, fallback){
+      const n = tag(el, name);
+      return n && n.textContent != null ? n.textContent.trim() : (fallback ?? '');
+    }
+
+    const infNFe = doc.getElementsByTagName('infNFe')[0];
+    if(!infNFe){
+      return { error: 'não encontrado <infNFe> — não parece uma NF-e', filename };
+    }
+
+    const ide = tag(infNFe, 'ide');
+    const emit = tag(infNFe, 'emit');
+    const total = tag(infNFe, 'total');
+    const icmsTot = tag(total, 'ICMSTot');
+    const nNF = txt(ide, 'nNF', '?');
+    const serie = txt(ide, 'serie', '');
+    const emitNome = txt(emit, 'xNome', '');
+    const vNF = txt(icmsTot, 'vNF', '');
+    const chave = (infNFe.getAttribute('Id') || '').replace(/^NFe/, '');
+
+    const dets = Array.from(infNFe.getElementsByTagName('det'));
+    const items = dets.map(det => {
+      const prod = tag(det, 'prod');
+      const nItem = det.getAttribute('nItem') || '';
+      return {
+        nfNumero: nNF,
+        nfSerie: serie,
+        emitente: emitNome,
+        vNF,
+        chave,
+        arquivo: filename,
+        nItem,
+        cProd: txt(prod, 'cProd', ''),
+        cEAN: txt(prod, 'cEAN', ''),
+        cEANTrib: txt(prod, 'cEANTrib', ''),
+        xProd: txt(prod, 'xProd', ''),
+        uCom: txt(prod, 'uCom', ''),
+        qCom: txt(prod, 'qCom', ''),
+        vUnCom: txt(prod, 'vUnCom', ''),
+        vProd: txt(prod, 'vProd', '')
+      };
+    });
+
+    return { items, filename };
+  }
+
+  // ---------- matching ----------
+  // Uma NF-e pode trazer dois códigos de barra por item: cEAN (comercial) e
+  // cEANTrib (tributável). Quando os dois existem e são diferentes, tentamos
+  // vincular cada um deles ao CODACESSO da planilha separadamente.
+  function matchItem(item, catalog){
+    const eanRaw = (item.cEAN && item.cEAN.toUpperCase() !== 'SEM GTIN') ? item.cEAN : '';
+    const eanTribRaw = (item.cEANTrib && item.cEANTrib.toUpperCase() !== 'SEM GTIN') ? item.cEANTrib : '';
+    const hasTwoCodes = !!eanRaw && !!eanTribRaw && normCode(eanRaw) !== normCode(eanTribRaw);
+
+    const eanKey = normCode(eanRaw);
+    const eanTribKey = normCode(eanTribRaw);
+    const eanRec = eanKey && catalog.has(eanKey) ? catalog.get(eanKey) : null;
+    const eanTribRec = eanTribKey && catalog.has(eanTribKey) ? catalog.get(eanTribKey) : null;
+
+    const barcodes = [];
+    if(eanRaw) barcodes.push({ field: 'cEAN', label: 'EAN', value: eanRaw, found: !!eanRec, record: eanRec });
+    if(eanTribRaw && hasTwoCodes) barcodes.push({ field: 'cEANTrib', label: 'EAN trib.', value: eanTribRaw, found: !!eanTribRec, record: eanTribRec });
+
+    let status, record, matchedField;
+    if(eanRec && eanTribRec){
+      record = eanRec;
+      const same = eanRec.seqProduto === eanTribRec.seqProduto;
+      status = same ? 'ok' : 'warn';
+      matchedField = same ? 'cEAN + cEANTrib' : 'cEAN + cEANTrib (códigos divergentes)';
+    } else if(eanRec){
+      record = eanRec; status = 'ok'; matchedField = 'cEAN';
+    } else if(eanTribRec){
+      record = eanTribRec; status = 'ok'; matchedField = 'cEANTrib';
+    } else {
+      // fallback: sometimes cProd itself is the barcode/reference used by the supplier
+      const fallbackKey = normCode(item.cProd);
+      if(fallbackKey && catalog.has(fallbackKey)){
+        record = catalog.get(fallbackKey); status = 'warn'; matchedField = 'cProd (fallback)';
+      } else {
+        record = null; status = 'danger'; matchedField = null;
+      }
+    }
+
+    return { status, record, matchedField, barcodes, hasTwoCodes };
+  }
+
+  // ---------- run ----------
+  async function runReconciliation(){
+    $('btn-run').disabled = true;
+    $('results').classList.remove('active');
+    $('stats').style.display = 'none';
+
+    try{
+      let allItems = [];
+      for(let i=0; i<xmlFiles.length; i++){
+        const f = xmlFiles[i];
+        setProgress('progress-wrap','progress-fill','progress-label', Math.round((i/xmlFiles.length)*80), `lendo ${f.name}…`);
+        const text = await f.text();
+        const parsed = parseNFeXml(text, f.name);
+        if(parsed.error){
+          allItems.push({ __error: parsed.error, arquivo: f.name });
+        } else {
+          allItems = allItems.concat(parsed.items);
+        }
+      }
+
+      setProgress('progress-wrap','progress-fill','progress-label', 92, 'conciliando itens…');
+      allRows = allItems.filter(it => !it.__error).map(item => {
+        const m = matchItem(item, catalogByCode);
+        return { item, match: m };
+      });
+
+      const errors = allItems.filter(it => it.__error);
+
+      setProgress('progress-wrap','progress-fill','progress-label', 100, 'concluído');
+      setTimeout(()=>hideProgress('progress-wrap'), 500);
+
+      renderNotesSummary();
+      renderStats();
+      renderTable();
+      $('results').classList.add('active');
+      $('stats').style.display = 'grid';
+
+      $('status-text').textContent = errors.length
+        ? `concluído com ${errors.length} arquivo(s) com erro de leitura`
+        : `concluído — ${allRows.length} itens processados`;
+
+    } catch(err){
+      console.error(err);
+      hideProgress('progress-wrap');
+      $('status-text').textContent = 'erro ao processar: ' + err.message;
+    } finally {
+      $('btn-run').disabled = !(catalogFixed && xmlFiles.length > 0);
+    }
+  }
+
+  $('btn-run').addEventListener('click', runReconciliation);
+
+  function currencyBRL(v){
+    const n = parseFloat(v);
+    if(isNaN(n)) return '—';
+    return n.toLocaleString('pt-BR', { style:'currency', currency:'BRL' });
+  }
+
+  function numBR(v){
+    const n = parseFloat(v);
+    if(isNaN(n)) return '—';
+    return n.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 4 });
+  }
+
+  // ---------- histórico persistente de notas (últimos 5 dias) ----------
+  const NOTES_HISTORY_KEY = 'conciliacaoNfeUltramarine.notasHistorico.v1';
+  const HISTORY_DAYS = 5;
+
+  function loadNotesHistory(){
+    try{
+      const raw = localStorage.getItem(NOTES_HISTORY_KEY);
+      const arr = raw ? JSON.parse(raw) : [];
+      return Array.isArray(arr) ? arr : [];
+    } catch(err){
+      console.warn('não foi possível ler o histórico de notas salvo', err);
+      return [];
+    }
+  }
+  function saveNotesHistory(arr){
+    try{ localStorage.setItem(NOTES_HISTORY_KEY, JSON.stringify(arr)); }
+    catch(err){ console.warn('não foi possível salvar o histórico de notas', err); }
+  }
+  function pruneNotesHistory(arr){
+    const cutoff = Date.now() - HISTORY_DAYS * 24 * 60 * 60 * 1000;
+    return arr.filter(n => n.ts >= cutoff);
+  }
+  function formatRelativeDate(ts){
+    const d = new Date(ts);
+    const startOfDay = dt => new Date(dt.getFullYear(), dt.getMonth(), dt.getDate()).getTime();
+    const diffDays = Math.round((startOfDay(new Date()) - startOfDay(d)) / 86400000);
+    if(diffDays <= 0) return 'Hoje';
+    if(diffDays === 1) return 'Ontem';
+    return d.toLocaleDateString('pt-BR', { day:'2-digit', month:'2-digit' });
+  }
+
+  let notesHistory = pruneNotesHistory(loadNotesHistory());
+
+  // Notas da conciliação atual (nesta sessão/nesta planilha carregada), a partir de allRows.
+  function computeCurrentRunNotes(){
+    const byNote = new Map();
+    for(const r of allRows){
+      const key = r.item.chave || `${r.item.arquivo}|${r.item.nfNumero}|${r.item.nfSerie}`;
+      if(!byNote.has(key)){
+        byNote.set(key, {
+          key,
+          nfNumero: r.item.nfNumero,
+          nfSerie: r.item.nfSerie,
+          emitente: r.item.emitente,
+          vNF: r.item.vNF,
+          total: 0,
+          cadastrados: 0
+        });
+      }
+      const n = byNote.get(key);
+      n.total++;
+      if(r.match.status === 'ok' || r.match.status === 'warn') n.cadastrados++;
+    }
+    return Array.from(byNote.values()).map(n => {
+      const pct = n.total ? Math.round((n.cadastrados / n.total) * 100) : 0;
+      const tone = pct >= 90 ? 'ok' : (pct >= 50 ? 'warn' : 'danger');
+      return Object.assign({ pct, tone }, n);
+    });
+  }
+
+  // Funde as notas da conciliação atual no histórico persistente (mantém a data
+  // original de importação de uma nota já vista; atualiza seus números).
+  function mergeCurrentRunIntoHistory(){
+    const current = computeCurrentRunNotes();
+    if(!current.length) return;
+    const map = new Map(notesHistory.map(n => [n.key, n]));
+    for(const n of current){
+      const existing = map.get(n.key);
+      const ts = existing ? existing.ts : Date.now();
+      map.set(n.key, Object.assign({}, n, { ts }));
+    }
+    notesHistory = pruneNotesHistory(Array.from(map.values()));
+    saveNotesHistory(notesHistory);
+  }
+
+  function renderNotesSummary(){
+    mergeCurrentRunIntoHistory();
+    notesHistory = pruneNotesHistory(notesHistory);
+    const notes = notesHistory.slice().sort((a,b) => b.ts - a.ts);
+    const grid = $('notes-grid');
+
+    if(!notes.length){
+      $('notes-panel').style.display = 'none';
+      $('notes-empty').style.display = 'block';
+      grid.innerHTML = '';
+      renderHomeDashboard();
+      return;
+    }
+
+    grid.innerHTML = notes.map(n => {
+      return `<div class="note-card">
+        <div class="note-fields">
+          <div class="note-field">
+            <span class="note-field-label">Nota fiscal</span>
+            <span class="note-field-value">${escapeHtml(n.nfNumero)}${n.nfSerie ? '/'+escapeHtml(n.nfSerie) : ''}</span>
+          </div>
+          <div class="note-field">
+            <span class="note-field-label">Fornecedor</span>
+            <span class="note-field-value" title="${escapeHtml(n.emitente || '—')}">${escapeHtml(n.emitente || 'não identificado')}</span>
+          </div>
+          <div class="note-field">
+            <span class="note-field-label">Valor da nota</span>
+            <span class="note-field-value mono">${currencyBRL(n.vNF)}</span>
+          </div>
+          <div class="note-field">
+            <span class="note-field-label">Itens cadastrados</span>
+            <span class="note-field-value mono">${n.cadastrados}/${n.total}</span>
+          </div>
+          <div class="note-field">
+            <span class="note-field-label">Importada</span>
+            <span class="note-field-value">${formatRelativeDate(n.ts)}</span>
+          </div>
+        </div>
+        <div class="hbar-wrap" title="${n.pct}% dos itens cadastrados na planilha">
+          <div class="hbar-track"><div class="hbar-fill ${n.tone}" style="width:${n.pct}%"></div></div>
+          <div class="hbar-pct">${n.pct}%</div>
+        </div>
+      </div>`;
+    }).join('');
+    $('notes-panel').style.display = 'block';
+    $('notes-empty').style.display = 'none';
+    renderHomeDashboard();
+  }
+
+  // ---------- painel (dashboard home) ----------
+  function renderHomeDashboard(){
+    const notes = notesHistory.slice().sort((a,b) => b.ts - a.ts);
+    const conciliados = notes.reduce((sum,n) => sum + n.cadastrados, 0);
+    const divergencias = notes.reduce((sum,n) => sum + (n.total - n.cadastrados), 0);
+
+    $('kpi-notas').textContent = notes.length.toLocaleString('pt-BR');
+    $('kpi-conciliados').textContent = conciliados.toLocaleString('pt-BR');
+    $('kpi-divergencias').textContent = divergencias.toLocaleString('pt-BR');
+    $('kpi-produtos').textContent = catalogByCode.size.toLocaleString('pt-BR');
+
+    const list = $('recent-list');
+    if(!notes.length){
+      list.innerHTML = '<div class="recent-empty">nenhuma nota conciliada ainda</div>';
+      return;
+    }
+    const recent = notes.slice(0, 5);
+    list.innerHTML = recent.map(n => {
+      const divergentes = n.total - n.cadastrados;
+      const semDivergencia = divergentes === 0;
+      const pillCls = semDivergencia ? 'ok' : 'warn';
+      const pillText = semDivergencia ? 'Sem divergências' : 'Com divergências';
+      const pillIcon = semDivergencia ? '✓' : '⚠';
+      return `<div class="recent-row">
+        <div class="recent-left">
+          <div class="nf">Nota ${escapeHtml(n.nfNumero)}${n.nfSerie ? ' · série '+escapeHtml(n.nfSerie) : ''}</div>
+          <div class="forn">${escapeHtml(n.emitente || 'fornecedor não identificado')} · ${formatRelativeDate(n.ts)}</div>
+        </div>
+        <div class="recent-right">
+          <div class="recent-count">${n.total} itens<br>${n.cadastrados} conc. · ${divergentes} div.</div>
+          <span class="badge ${pillCls}"><span class="dot"></span>${pillIcon} ${pillText}</span>
+        </div>
+      </div>`;
+    }).join('');
+  }
+
+  function renderStats(){
+    const total = allRows.length;
+    const ok = allRows.filter(r => r.match.status === 'ok').length;
+    const warn = allRows.filter(r => r.match.status === 'warn').length;
+    const danger = allRows.filter(r => r.match.status === 'danger').length;
+    $('s-total').textContent = total.toLocaleString('pt-BR');
+    $('s-ok').textContent = ok.toLocaleString('pt-BR');
+    $('s-danger').textContent = danger.toLocaleString('pt-BR');
+  }
+
+  function statusBadge(status){
+    if(status === 'ok') return `<span class="badge ok"><span class="dot"></span>conferido</span>`;
+    if(status === 'warn') return `<span class="badge warn"><span class="dot"></span>parcial</span>`;
+    return `<span class="badge danger"><span class="dot"></span>não localizado</span>`;
+  }
+
+  function renderBarcodeCell(m, item){
+    if(!m.barcodes.length){
+      return item.cProd ? 'sem GTIN' : '—';
+    }
+    if(m.barcodes.length === 1){
+      return escapeHtml(m.barcodes[0].value);
+    }
+    // mais de um código de barras na nota: mostra a vinculação de cada um
+    return m.barcodes.map(b => {
+      const cls = b.found ? 'barcode-ok' : 'barcode-miss';
+      const icon = b.found ? '✓' : '✕';
+      return `<div class="barcode-line ${cls}"><span class="barcode-tag">${icon}</span> ${escapeHtml(b.label)}: ${escapeHtml(b.value)}</div>`;
+    }).join('');
+  }
+
+  function renderTable(){
+    const q = $('search').value.trim().toLowerCase();
+    const tbody = $('tbody');
+    const rows = allRows.filter(r => {
+      if(activeFilter !== 'all' && r.match.status !== activeFilter) return false;
+      if(!q) return true;
+      const hay = [
+        r.item.xProd, r.item.cEAN, r.item.cEANTrib, r.item.cProd, r.item.uCom,
+        r.match.record && r.match.record.fornecedor,
+        r.match.record && r.match.record.descricao,
+        r.match.record && r.match.record.seqProduto,
+        r.match.record && r.match.record.embalagem,
+        r.item.nfNumero
+      ].filter(Boolean).join(' ').toLowerCase();
+      return hay.includes(q);
+    });
+
+    if(!rows.length){
+      tbody.innerHTML = `<tr class="empty-row"><td colspan="11">nenhum item corresponde ao filtro atual</td></tr>`;
+      return;
+    }
+
+    tbody.innerHTML = rows.map(r => {
+      const rec = r.match.record;
+      return `<tr>
+        <td class="mono">${escapeHtml(r.item.nfNumero)}${r.item.nfSerie ? '/'+escapeHtml(r.item.nfSerie) : ''}</td>
+        <td class="mono">${escapeHtml(r.item.nItem)}</td>
+        <td class="mono">${renderBarcodeCell(r.match, r.item)}</td>
+        <td>${escapeHtml(r.item.xProd)}<div class="desc-nf">ref. fornecedor: ${escapeHtml(r.item.cProd || '—')}</div></td>
+        <td class="mono">${numBR(r.item.qCom)}</td>
+        <td class="mono">${escapeHtml(r.item.uCom) || '—'}</td>
+        <td class="code-internal">${rec ? escapeHtml(rec.seqProduto) : '—'}</td>
+        <td>${rec ? escapeHtml(rec.fornecedor) : '—'}</td>
+        <td>${rec ? escapeHtml(rec.descricao) : '—'}</td>
+        <td class="mono">${rec ? escapeHtml(rec.embalagem) : '—'}</td>
+        <td>${statusBadge(r.match.status)}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  $('chips').addEventListener('click', (e)=>{
+    const btn = e.target.closest('.chip');
+    if(!btn) return;
+    document.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
+    btn.classList.add('active');
+    activeFilter = btn.dataset.filter;
+    renderTable();
+  });
+
+  $('search').addEventListener('input', renderTable);
+
+  $('btn-export').addEventListener('click', ()=>{
+    const headers = ['NF','Serie','Item','Arquivo','cEAN','cEAN_vinculado','cEANTrib','cEANTrib_vinculado','DescricaoNF','QtdNF','EmbalagemNF','RefFornecedorNF','CodigoInterno','Fornecedor','DescricaoCatalogo','EmbalagemCadastro','TipoCodigo','Status','CampoCasado'];
+    const lines = [headers.join(';')];
+    for(const r of allRows){
+      const rec = r.match.record;
+      const ean = r.match.barcodes.find(b => b.field === 'cEAN');
+      const eanTrib = r.match.barcodes.find(b => b.field === 'cEANTrib');
+      const fields = [
+        r.item.nfNumero, r.item.nfSerie, r.item.nItem, r.item.arquivo,
+        ean ? ean.value : (r.item.cEAN || ''), ean ? (ean.found ? 'sim' : 'não') : '',
+        eanTrib ? eanTrib.value : '', eanTrib ? (eanTrib.found ? 'sim' : 'não') : '',
+        r.item.xProd, r.item.qCom, r.item.uCom, r.item.cProd,
+        rec ? rec.seqProduto : '', rec ? rec.fornecedor : '', rec ? rec.descricao : '',
+        rec ? rec.embalagem : '', rec ? rec.tipoCodigo : '',
+        r.match.status, r.match.matchedField || ''
+      ].map(v => `"${String(v ?? '').replace(/"/g,'""')}"`);
+      lines.push(fields.join(';'));
+    }
+    const csv = '\uFEFF' + lines.join('\r\n');
+    const blob = new Blob([csv], { type:'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'conciliacao-nfe.csv';
+    a.click();
+    URL.revokeObjectURL(url);
+  });
+
+  // ---------- exportação em Excel (.xlsx) por status ----------
+  function rowToExcelRecord(r){
+    const rec = r.match.record;
+    const ean = r.match.barcodes.find(b => b.field === 'cEAN');
+    const eanTrib = r.match.barcodes.find(b => b.field === 'cEANTrib');
+    const statusLabel = r.match.status === 'ok' ? 'Conferido' : (r.match.status === 'warn' ? 'Parcial' : 'Não localizado');
+    return {
+      'NF': r.item.nfNumero + (r.item.nfSerie ? '/' + r.item.nfSerie : ''),
+      'Item': r.item.nItem,
+      'Cód. barras (NF)': ean ? ean.value : (r.item.cEAN || ''),
+      'Cód. barras trib. (NF)': eanTrib ? eanTrib.value : '',
+      'Descrição NF': r.item.xProd,
+      'Qtd. NF': parseFloat(r.item.qCom) || '',
+      'Emb. NF': r.item.uCom || '',
+      'Ref. fornecedor (cProd)': r.item.cProd || '',
+      'Cód. interno': rec ? rec.seqProduto : '',
+      'Fornecedor (cadastro)': rec ? rec.fornecedor : '',
+      'Descrição catálogo': rec ? rec.descricao : '',
+      'Emb. cadastro': rec ? rec.embalagem : '',
+      'Status': statusLabel
+    };
+  }
+
+  function exportRowsToExcel(rows, filename, sheetName){
+    if(!rows.length){
+      alert('Não há itens nessa categoria para exportar.');
+      return;
+    }
+    const data = rows.map(rowToExcelRecord);
+    const ws = XLSX.utils.json_to_sheet(data);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, sheetName);
+    XLSX.writeFile(wb, filename);
+  }
+
+  $('btn-export-ok').addEventListener('click', ()=>{
+    exportRowsToExcel(allRows.filter(r => r.match.status === 'ok'), 'itens-conferidos.xlsx', 'Conferidos');
+  });
+  $('btn-export-danger').addEventListener('click', ()=>{
+    exportRowsToExcel(allRows.filter(r => r.match.status === 'danger'), 'itens-nao-localizados.xlsx', 'Não localizados');
+  });
+
+  // ---------- navegação entre views (sidebar + atalhos do painel) ----------
+  function setView(name){
+    document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+    document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+    const view = $('view-' + name);
+    if(!view) return;
+    view.classList.add('active');
+    const navBtn = document.querySelector(`.nav-item[data-nav="${name}"]`);
+    if(navBtn) navBtn.classList.add('active');
+  }
+
+  document.querySelectorAll('[data-nav]').forEach(el => {
+    el.addEventListener('click', ()=> setView(el.dataset.nav));
+  });
+
+  renderNotesSummary(); // restaura o histórico de notas dos últimos 5 dias salvo no navegador
+
+})();
